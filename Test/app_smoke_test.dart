@@ -25,14 +25,21 @@ void main() {
     app.demoLogin('rosni');
     expect(app.currentUser?.name, 'Rosni Akter');
 
-    await tester.pumpWidget(MaterialApp(
-      theme: buildTheme(),
-      home: ListenableBuilder(listenable: app, builder: (_, __) => const Shell()),
-    ));
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildTheme(),
+        home: ListenableBuilder(
+          listenable: app,
+          builder: (_, child) => const Shell(),
+        ),
+      ),
+    );
     await tester.pumpAndSettle(const Duration(seconds: 1));
     expect(find.textContaining('Rosni'), findsWidgets); // Home greeting
 
-    await tester.tap(find.text('Weather').last); // bottom-nav tab (also appears as a quick action)
+    await tester.tap(
+      find.text('Weather').last,
+    ); // bottom-nav tab (also appears as a quick action)
     await tester.pumpAndSettle(const Duration(seconds: 1));
     expect(find.text('Weather & advisory'), findsOneWidget);
 
@@ -49,18 +56,26 @@ void main() {
     expect(find.text('Rosni Akter'), findsWidgets);
   });
 
-  test('submitting a price is reflected in the market list (sheet data flow)', () async {
-    SharedPreferences.setMockInitialValues({});
-    await app.init();
-    app.demoLogin('mehedi'); // trader submits
+  test(
+    'submitting a price is reflected in the market list (sheet data flow)',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      await app.init();
+      app.demoLogin('mehedi'); // trader submits
 
-    final before = app.marketsWithPrice('rice', 100).where((m) => m.market.id == 'c7').length;
-    await app.submitPrice(cropId: 'rice', marketId: 'c7', price: 77);
-    final row = app.marketsWithPrice('rice', 100).firstWhere((m) => m.market.id == 'c7');
-    expect(row.latest?.price, 77);
-    expect(row.latest?.by, 'Mehedi');
-    expect(before, isNotNull);
-  });
+      final before = app
+          .marketsWithPrice('rice', 100)
+          .where((m) => m.market.id == 'c7')
+          .length;
+      await app.submitPrice(cropId: 'rice', marketId: 'c7', price: 77);
+      final row = app
+          .marketsWithPrice('rice', 100)
+          .firstWhere((m) => m.market.id == 'c7');
+      expect(row.latest?.price, 77);
+      expect(row.latest?.by, 'Mehedi');
+      expect(before, isNotNull);
+    },
+  );
 
   test('target price triggers price alerts, then de-duplicates', () async {
     SharedPreferences.setMockInitialValues({});

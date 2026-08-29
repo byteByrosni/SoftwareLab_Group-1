@@ -1,0 +1,25 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+// One row per record. `data` stores the same JSON shape the app's
+// toMap()/fromMap() methods already produce — no Dart model changes needed.
+model User {
+  id   String @id
+  data String // JSON blob
+}
+
+model Market {
+  id   String @id
+  data String // JSON blob
+}
+
+model Price {
+  id   String @id
+  data String // JSON blob
+}

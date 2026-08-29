@@ -17,14 +17,15 @@ class KrishiApp extends StatelessWidget {
   const KrishiApp({super.key});
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: app,
-      builder: (context, _) => MaterialApp(
-        title: 'KrishiBondhu',
-        debugShowCheckedModeBanner: false,
-        theme: buildTheme(),
-        home: const RootGate(),
-      ),
+    // The app-state subscription deliberately lives *inside* MaterialApp (see
+    // RootGate below), not around it. Wrapping MaterialApp does nothing useful:
+    // `home` becomes a Navigator route that is built once and cached, so
+    // rebuilding MaterialApp never rebuilds the screen the user is looking at.
+    return MaterialApp(
+      title: 'KrishiBondhu',
+      debugShowCheckedModeBanner: false,
+      theme: buildTheme(),
+      home: const RootGate(),
     );
   }
 }
@@ -58,9 +59,18 @@ class _RootGateState extends State<RootGate> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_revealed) return const SplashScreen();
-    _maybeIntro();
-    return app.currentUser != null ? const Shell() : const AuthScreen();
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) {
+        if (!_revealed) return SplashScreen();
+        _maybeIntro();
+        // Deliberately NOT const. A const widget is the same canonical instance
+        // on every rebuild, so Flutter's element reconciliation short-circuits
+        // (`child.widget == newWidget`) and never re-runs build() — which
+        // silently freezes any subtree that reads mutable `app` state.
+        return app.currentUser != null ? Shell() : AuthScreen();
+      },
+    );
   }
 }
 
@@ -145,7 +155,7 @@ void showIntroDialog(BuildContext context) {
                   decoration: BoxDecoration(color: C.green50, borderRadius: BorderRadius.circular(14), border: Border.all(color: C.green100)),
                   child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Text('🎬  ', style: TextStyle(fontSize: 17)),
-                    Expanded(child: Text('To test the app, please log in with a demo account.\nটেস্ট করার জন্য একটি ডেমো অ্যাকাউন্ট দিয়ে লগইন করুন।',
+                    Expanded(child: Text('To test the app, please register a new account.\nটেস্ট করার জন্য একটি নতুন অ্যাকাউন্ট নিবন্ধন করুন।',
                         style: TextStyle(fontSize: 12.5, color: C.green800, height: 1.6))),
                   ]),
                 ),

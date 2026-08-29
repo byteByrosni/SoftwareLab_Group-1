@@ -24,10 +24,20 @@ class _AuthScreenState extends State<AuthScreen> {
   String role = 'farmer';
   Loc? location;
   final Set<String> pickedCrops = {};
+  bool _submitting = false;
 
   void _login() {
+    if (_submitting) return;
+    setState(() => _submitting = true);
     final err = app.login(credC.text, passC.text);
-    if (err != null) setState(() => error = err);
+    // Always release the button. notifyListeners() only marks the tree dirty —
+    // the rebuild that swaps this screen out happens on the next frame — so
+    // this runs safely either way, and the button can never latch on failure.
+    if (!mounted) return;
+    setState(() {
+      error = err;
+      _submitting = false;
+    });
   }
 
   bool _validateStep1() {
@@ -56,17 +66,45 @@ class _AuthScreenState extends State<AuthScreen> {
       setState(() => error = app.t('selectAtLeastOne'));
       return;
     }
+    if (_submitting) return;
+    setState(() => _submitting = true);
     final err = app.register(
       name: nameC.text, cred: credC.text, pass: passC.text, role: role,
       location: location ?? Loc(22.3569, 91.7832, locC.text.trim().isEmpty ? 'Chattogram' : locC.text.trim()),
       crops: pickedCrops.toList(),
     );
-    if (err != null) setState(() => error = err);
+    if (!mounted) return;
+    setState(() {
+      error = err;
+      _submitting = false;
+    });
+  }
+
+  // System back: step backwards through the register wizard (crops → location →
+  // form → login) rather than closing the app. Mirrors the in-app "← Back"
+  // links, and covers step 1, which has no back affordance of its own.
+  void _handleBack() {
+    setState(() {
+      if (step == 'crops') {
+        step = 'location';
+      } else if (step == 'location') {
+        step = 'form';
+      } else {
+        mode = 'login';
+        step = 'form';
+      }
+      error = null;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PopScope(
+      canPop: mode == 'login',
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _handleBack();
+      },
+      child: Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
           child: Column(children: [
@@ -80,6 +118,7 @@ class _AuthScreenState extends State<AuthScreen> {
             ),
           ]),
         ),
+      ),
       ),
     );
   }
@@ -100,10 +139,22 @@ class _AuthScreenState extends State<AuthScreen> {
           const Spacer(),
           _langToggle(),
         ]),
+        if (app.backendSyncing) ...[
+          const SizedBox(height: 12),
+          _syncingBadge(),
+        ],
         const SizedBox(height: 20),
         Center(child: Text(mode == 'login' ? '🧑‍🌾' : '🌱', style: const TextStyle(fontSize: 54))),
       ]),
     );
+  }
+
+  Widget _syncingBadge() {
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white.withValues(alpha: .85))),
+      const SizedBox(width: 8),
+      Text(app.t('syncingNow'), style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: .85))),
+    ]);
   }
 
   Widget _langToggle() {
@@ -149,13 +200,15 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 
-  Widget _primaryBtn(String label, VoidCallback onTap) {
+  Widget _primaryBtn(String label, VoidCallback onTap, {bool loading = false}) {
     return SizedBox(
       width: double.infinity,
       child: FilledButton(
         style: FilledButton.styleFrom(backgroundColor: C.green600, padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
-        onPressed: onTap,
-        child: Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Colors.white)),
+        onPressed: loading ? null : onTap,
+        child: loading
+            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white))
+            : Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: Colors.white)),
       ),
     );
   }
@@ -170,17 +223,7 @@ class _AuthScreenState extends State<AuthScreen> {
       _errorBox(),
       _field(app.t('phoneEmail'), credC, hint: '01XXXXXXXXX', icon: '📱'),
       _field(app.t('password'), passC, hint: '••••••', obscure: true, icon: '🔒'),
-      _primaryBtn('${app.t('login')}  →', _login),
-      const SizedBox(height: 18),
-      Center(child: Text('🎬 ${app.t('tryDemo')}', style: tsMuted())),
-      const SizedBox(height: 8),
-      Row(children: [
-        Expanded(child: _demoBtn('🧑‍🌾 ${app.t('roleFarmer')}', 'rosni')),
-        const SizedBox(width: 8),
-        Expanded(child: _demoBtn('🛒 ${app.t('roleTrader')}', 'mehedi')),
-        const SizedBox(width: 8),
-        Expanded(child: _demoBtn('👤 ${app.t('roleUser')}', 'nafisa')),
-      ]),
+      _primaryBtn('${app.t('login')}  →', _login, loading: _submitting),
       const SizedBox(height: 18),
       Center(child: GestureDetector(
         onTap: () => setState(() { mode = 'register'; step = 'form'; error = null; }),
@@ -190,14 +233,6 @@ class _AuthScreenState extends State<AuthScreen> {
         ])),
       )),
     ]);
-  }
-
-  Widget _demoBtn(String label, String cred) {
-    return OutlinedButton(
-      style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11), side: const BorderSide(color: C.line), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)), foregroundColor: C.ink700),
-      onPressed: () => app.demoLogin(cred),
-      child: Text(label, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700), textAlign: TextAlign.center),
-    );
   }
 
   // ---------------- REGISTER ----------------
@@ -285,7 +320,7 @@ class _AuthScreenState extends State<AuthScreen> {
               })),
       ]),
       const SizedBox(height: 20),
-      _primaryBtn('${app.t('done')}  ✓', _finish),
+      _primaryBtn('${app.t('done')}  ✓', _finish, loading: _submitting),
       const SizedBox(height: 12),
       Center(child: GestureDetector(onTap: () => setState(() => step = 'location'), child: Text('← ${app.t('back')}', style: tsSub()))),
     ]);

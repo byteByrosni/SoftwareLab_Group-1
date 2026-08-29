@@ -1,13 +1,27 @@
 // KrishiBondhu — central app state, persistence, live sync, weather, seeding.
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+
 import 'data.dart';
 import 'strings.dart';
-import 'firebase_boot.dart';
+
+// Best demo setup: backend/server.js serves both the Flutter PWA and /api from
+// the same ngrok URL, so no env var is needed. If the frontend is served from a
+// different URL, pass KB_API_BASE at build/run time, for example:
+//   flutter build web --dart-define=KB_API_BASE=https://your-backend.ngrok-free.app
+//   flutter build apk --dart-define=KB_API_BASE=https://your-backend.ngrok-free.app
+const _configuredApiBase = String.fromEnvironment('KB_API_BASE');
+String get _api {
+  final configured = _configuredApiBase.trim().replaceFirst(RegExp(r'/+$'), '');
+  if (configured.isNotEmpty) {
+    return configured.endsWith('/api') ? configured : '$configured/api';
+  }
+  return kIsWeb ? '/api' : '';
+}
 
 class MarketRow {
   final Market market;
@@ -21,7 +35,9 @@ class MarketRow {
 class AppState extends ChangeNotifier {
   String lang = 'en';
   String? session;
-  bool useFirebase = false;
+  bool useBackend = false;
+  bool backendSyncing = false;
+  Timer? _pollTimer;
 
   List<AppUser> users = [];
   List<Market> markets = List.of(seedMarkets);
@@ -43,7 +59,6 @@ class AppState extends ChangeNotifier {
   final Set<String> _alertedPrice = {};
 
   SharedPreferences? _prefs;
-  FirebaseFirestore? _db;
 
   // ------------------------------------------------------------------ //
   String t(String k) {
@@ -74,32 +89,21 @@ class AppState extends ChangeNotifier {
     weatherAlerts = _prefs!.getBool('weatherAlerts') ?? true;
     priceAlerts = _prefs!.getBool('priceAlerts') ?? true;
 
-    final cfg = readWebFirebaseConfig();
-    if (cfg != null) {
-      try {
-        await Firebase.initializeApp(
-          options: FirebaseOptions(
-            apiKey: cfg['apiKey']!,
-            appId: cfg['appId']!,
-            messagingSenderId: cfg['messagingSenderId']!,
-            projectId: cfg['projectId']!,
-            authDomain: cfg['authDomain'],
-            storageBucket: cfg['storageBucket'],
-          ),
-        );
-        _db = FirebaseFirestore.instance;
-        useFirebase = true;
-      } catch (e) {
-        useFirebase = false;
-      }
-    }
+    // Always populate instantly from local cache/seed data first, so the UI
+    // has something to show and is immediately interactive — never blocked
+    // on the network. If a backend is reachable, sync with it in the
+    // background and let notifyListeners() upgrade the UI whenever that
+    // finishes (fast on a good connection, still eventually consistent on a
+    // slow one — but never makes the app *feel* stuck).
+    _bootLocal();
 
-    if (useFirebase) {
-      await _bootFirebase();
-    } else {
-      _bootLocal();
+    if (_api.isNotEmpty) {
+      backendSyncing = true;
+      _bootBackend().whenComplete(() {
+        backendSyncing = false;
+        notifyListeners();
+      });
     }
-    notifyListeners();
   }
 
   // ---- Local mode ----
@@ -108,10 +112,19 @@ class AppState extends ChangeNotifier {
     if (raw != null) {
       try {
         final m = jsonDecode(raw);
-        users = (m['users'] as List).map((u) => AppUser.fromMap(Map.from(u))).toList();
-        markets = (m['markets'] as List).map((x) => Market.fromMap(Map<String, dynamic>.from(x))).toList();
-        prices = (m['prices'] as List).map((p) => PriceEntry.fromMap(Map.from(p))).toList();
+        users = (m['users'] as List)
+            .map((u) => AppUser.fromMap(Map.from(u)))
+            .toList();
+        markets = (m['markets'] as List)
+            .map((x) => Market.fromMap(Map<String, dynamic>.from(x)))
+            .toList();
+        prices = (m['prices'] as List)
+            .map((p) => PriceEntry.fromMap(Map.from(p)))
+            .toList();
       } catch (_) {}
+    }
+    if (markets.isEmpty) {
+      markets = List.of(seedMarkets);
     }
     if (users.isEmpty) {
       _seedInto(users, prices);
@@ -120,116 +133,253 @@ class AppState extends ChangeNotifier {
   }
 
   void _persistLocal() {
-    if (useFirebase) return;
-    _prefs?.setString('data', jsonEncode({
-      'users': users.map((u) => u.toMap()).toList(),
-      'markets': markets.map((m) => m.toMap()).toList(),
-      'prices': prices.map((p) => p.toMap()).toList(),
-    }));
+    if (useBackend) return;
+    _prefs?.setString(
+      'data',
+      jsonEncode({
+        'users': users.map((u) => u.toMap()).toList(),
+        'markets': markets.map((m) => m.toMap()).toList(),
+        'prices': prices.map((p) => p.toMap()).toList(),
+      }),
+    );
   }
 
-  // ---- Firebase mode ----
-  Future<void> _bootFirebase() async {
-    // seed once if empty
-    final mSnap = await _db!.collection('markets').limit(1).get();
-    if (mSnap.docs.isEmpty) {
-      final seedUsers = <AppUser>[];
-      final seedPrices = <PriceEntry>[];
-      _seedInto(seedUsers, seedPrices);
-      final batch = _db!.batch();
-      for (final m in seedMarkets) {
-        batch.set(_db!.collection('markets').doc(m.id), m.toMap());
+  // ---- Backend mode (kb-backend/server.js over HTTP) ----
+  // Never awaited from init() — runs in the background so a slow or
+  // unreachable backend can't block the UI. All three collections are
+  // fetched (and, when seeding, all writes are sent) concurrently rather
+  // than one-at-a-time, so a real network round-trip only costs one
+  // timeout's worth of latency, not the sum of dozens of sequential ones.
+  Future<bool> _bootBackend() async {
+    // Web: always eligible (same-origin). Native: only if KB_API_BASE was
+    // baked in at build time — otherwise fall back to local mode (this also
+    // keeps `flutter test`, which is neither web nor built with the define,
+    // network-free).
+    if (_api.isEmpty || !await _backendReachable()) return false;
+    try {
+      final fetched = await _fetchAllCollections();
+
+      if (fetched.$2.isEmpty) {
+        // Seed once if the backend itself has no users yet, reusing the same
+        // demo data as local mode. Merge instead of replacing: local-first boot
+        // means a user can register while this initial backend request is still
+        // in flight, and that in-memory account must not be discarded.
+        final seedUsers = <AppUser>[];
+        final seedPrices = <PriceEntry>[];
+        _seedInto(seedUsers, seedPrices);
+        _mergeCollections(seedMarkets, seedUsers, seedPrices);
+        await Future.wait([
+          for (final m in markets) _putJson('markets', m.id, m.toMap()),
+          for (final u in users) _putJson('users', u.id, u.toMap()),
+          for (final p in prices) _putJson('prices', p.id, p.toMap()),
+        ]);
+      } else {
+        _mergeCollections(fetched.$1, fetched.$2, fetched.$3);
       }
-      for (final u in seedUsers) {
-        batch.set(_db!.collection('users').doc(u.id), u.toMap());
-      }
-      for (final p in seedPrices) {
-        batch.set(_db!.collection('prices').doc(p.id), p.toMap());
-      }
-      await batch.commit();
-    }
-    // live listeners
-    _db!.collection('markets').snapshots().listen((s) {
-      markets = s.docs.map((d) => Market.fromMap(Map<String, dynamic>.from(d.data()))).toList();
       if (markets.isEmpty) markets = List.of(seedMarkets);
+
+      useBackend = true;
+      _pollTimer?.cancel();
+      _pollTimer = Timer.periodic(
+        const Duration(seconds: 3),
+        (_) => _pollBackend(),
+      );
       notifyListeners();
-    });
-    _db!.collection('users').snapshots().listen((s) {
-      users = s.docs.map((d) => AppUser.fromMap(Map.from(d.data()))).toList();
-      notifyListeners();
-    });
-    _db!.collection('prices').snapshots().listen((s) {
-      prices = s.docs.map((d) => PriceEntry.fromMap(Map.from(d.data()))).toList();
-      notifyListeners();
-    });
-    // wait for first users load
-    await _db!.collection('users').get().then((s) {
-      users = s.docs.map((d) => AppUser.fromMap(Map.from(d.data()))).toList();
-    });
-    await _db!.collection('prices').get().then((s) {
-      prices = s.docs.map((d) => PriceEntry.fromMap(Map.from(d.data()))).toList();
-    });
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
+
+  Future<void> _pollBackend() async {
+    try {
+      final fetched = await _fetchAllCollections();
+      _mergeCollections(fetched.$1, fetched.$2, fetched.$3);
+      notifyListeners();
+    } catch (_) {
+      // transient failure — keep last-known state, retry on the next tick
+    }
+  }
+
+  // Upserts fetched rows into the in-memory lists by id, instead of wholesale
+  // replacing them. Replacing outright is what caused a real bug: a just-added
+  // local record (e.g. a brand-new registration) could be silently wiped out
+  // by the very next poll if it landed before that record's own save to the
+  // backend had finished — logging the user back out and, on their retry,
+  // legitimately (and confusingly) tripping the "already registered" check.
+  // The app never deletes records, so merging is always safe: nothing the
+  // backend doesn't yet know about is ever removed from view.
+  void _mergeCollections(List<Market> m, List<AppUser> u, List<PriceEntry> p) {
+    markets = _mergeById(markets, m, (x) => x.id);
+    users = _mergeById(users, u, (x) => x.id);
+    prices = _mergeById(prices, p, (x) => x.id);
+  }
+
+  List<T> _mergeById<T>(
+    List<T> existing,
+    List<T> fetched,
+    String Function(T) idOf,
+  ) {
+    final byId = {for (final e in existing) idOf(e): e};
+    for (final f in fetched) {
+      byId[idOf(f)] = f;
+    }
+    return byId.values.toList();
+  }
+
+  // One request keeps startup and polling responsive over ngrok/mobile networks.
+  Future<(List<Market>, List<AppUser>, List<PriceEntry>)>
+  _fetchAllCollections() async {
+    final res = await http
+        .get(Uri.parse('$_api/snapshot'))
+        .timeout(const Duration(seconds: 6));
+    if (res.statusCode != 200) throw Exception('bad status ${res.statusCode}');
+    final data = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
+    return (
+      _decodeList(data['markets'], Market.fromMap),
+      _decodeList(data['users'], AppUser.fromMap),
+      _decodeList(data['prices'], PriceEntry.fromMap),
+    );
+  }
+
+  Future<bool> _backendReachable() async {
+    try {
+      final res = await http
+          .get(Uri.parse('$_api/health'))
+          .timeout(const Duration(seconds: 2));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  List<T> _decodeList<T>(
+    Object? raw,
+    T Function(Map<String, dynamic>) fromMap,
+  ) {
+    return (raw as List? ?? const [])
+        .map((e) => fromMap(Map<String, dynamic>.from(e as Map)))
+        .toList();
+  }
+
+  Future<void> _putJson(
+    String collection,
+    String id,
+    Map<String, dynamic> body,
+  ) => http
+      .put(
+        Uri.parse('$_api/$collection/$id'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      )
+      .timeout(const Duration(seconds: 3));
 
   // ------------------------------------------------------------------ //
   // Persistence helpers (write-through)
   // ------------------------------------------------------------------ //
   Future<void> _saveUser(AppUser u) async {
-    if (useFirebase) {
-      await _db!.collection('users').doc(u.id).set(u.toMap());
+    if (useBackend) {
+      try {
+        await _putJson('users', u.id, u.toMap());
+      } catch (_) {}
     } else {
       _persistLocal();
-      notifyListeners();
     }
+    notifyListeners();
   }
 
   Future<void> _addPrice(PriceEntry p) async {
-    if (useFirebase) {
-      await _db!.collection('prices').doc(p.id).set(p.toMap());
+    prices.add(p);
+    if (useBackend) {
+      try {
+        await _putJson('prices', p.id, p.toMap());
+      } catch (_) {}
     } else {
-      prices.add(p);
       _persistLocal();
-      notifyListeners();
     }
+    notifyListeners();
   }
 
   Future<void> _addMarket(Market m) async {
     markets.add(m);
-    if (useFirebase) {
-      await _db!.collection('markets').doc(m.id).set(m.toMap());
+    if (useBackend) {
+      try {
+        await _putJson('markets', m.id, m.toMap());
+      } catch (_) {}
     } else {
       _persistLocal();
-      notifyListeners();
     }
+    notifyListeners();
   }
 
   // ------------------------------------------------------------------ //
   // Seeding (3 demo accounts: Rosni Akter / Mehedi / Nafisa)
   // ------------------------------------------------------------------ //
   void _seedInto(List<AppUser> outUsers, List<PriceEntry> outPrices) {
-    final ctg = () => Loc(22.3569, 91.7832, 'Chattogram');
+    Loc ctg() => Loc(22.3569, 91.7832, 'Chattogram');
     final now = DateTime.now().millisecondsSinceEpoch;
     const day = 24 * 3600 * 1000;
 
-    outUsers.add(AppUser(
-      id: 'u_rosni', name: 'Rosni Akter', cred: 'rosni', pass: '1234', role: 'farmer',
-      location: ctg(), crops: ['rice', 'potato', 'tomato', 'onion', 'chili'],
-      targets: {'rice': 55, 'chili': 215},
-      reminders: [
-        Reminder(id: 'r_d1', type: 'irrigation', cropId: 'rice', repeat: 'daily', time: '06:00'),
-        Reminder(id: 'r_d2', type: 'spraying', cropId: 'potato', repeat: 'weekly', time: '16:00'),
-        Reminder(id: 'r_d3', type: 'harvest', cropId: 'rice', repeat: 'none', time: '07:00'),
-      ],
-      createdAt: now - 26 * day,
-    ));
-    outUsers.add(AppUser(
-      id: 'u_mehedi', name: 'Mehedi', cred: 'mehedi', pass: '1234', role: 'trader',
-      location: ctg(), crops: ['rice', 'onion', 'chili', 'potato'], createdAt: now - 40 * day,
-    ));
-    outUsers.add(AppUser(
-      id: 'u_nafisa', name: 'Nafisa', cred: 'nafisa', pass: '1234', role: 'user',
-      location: ctg(), crops: ['tomato', 'onion'], createdAt: now - 15 * day,
-    ));
+    outUsers.add(
+      AppUser(
+        id: 'u_rosni',
+        name: 'Rosni Akter',
+        cred: 'rosni',
+        pass: '1234',
+        role: 'farmer',
+        location: ctg(),
+        crops: ['rice', 'potato', 'tomato', 'onion', 'chili'],
+        targets: {'rice': 55, 'chili': 215},
+        reminders: [
+          Reminder(
+            id: 'r_d1',
+            type: 'irrigation',
+            cropId: 'rice',
+            repeat: 'daily',
+            time: '06:00',
+          ),
+          Reminder(
+            id: 'r_d2',
+            type: 'spraying',
+            cropId: 'potato',
+            repeat: 'weekly',
+            time: '16:00',
+          ),
+          Reminder(
+            id: 'r_d3',
+            type: 'harvest',
+            cropId: 'rice',
+            repeat: 'none',
+            time: '07:00',
+          ),
+        ],
+        createdAt: now - 26 * day,
+      ),
+    );
+    outUsers.add(
+      AppUser(
+        id: 'u_mehedi',
+        name: 'Mehedi',
+        cred: 'mehedi',
+        pass: '1234',
+        role: 'trader',
+        location: ctg(),
+        crops: ['rice', 'onion', 'chili', 'potato'],
+        createdAt: now - 40 * day,
+      ),
+    );
+    outUsers.add(
+      AppUser(
+        id: 'u_nafisa',
+        name: 'Nafisa',
+        cred: 'nafisa',
+        pass: '1234',
+        role: 'user',
+        location: ctg(),
+        crops: ['tomato', 'onion'],
+        createdAt: now - 15 * day,
+      ),
+    );
 
     const h = 3600 * 1000;
     final seeds = <List<Object>>[
@@ -253,11 +403,17 @@ class AppState extends ChangeNotifier {
     ];
     var idc = 1;
     for (final s in seeds) {
-      outPrices.add(PriceEntry(
-        id: 'pd${idc++}', cropId: s[0] as String, marketId: s[1] as String,
-        price: s[2] as int, by: s[3] as String, role: s[4] as String,
-        ts: now - ((s[5] as num) * h).round(),
-      ));
+      outPrices.add(
+        PriceEntry(
+          id: 'pd${idc++}',
+          cropId: s[0] as String,
+          marketId: s[1] as String,
+          price: s[2] as int,
+          by: s[3] as String,
+          role: s[4] as String,
+          ts: now - ((s[5] as num) * h).round(),
+        ),
+      );
     }
   }
 
@@ -311,8 +467,10 @@ class AppState extends ChangeNotifier {
   // Auth
   // ------------------------------------------------------------------ //
   static bool isValidPhone(String v) =>
-      RegExp(r'^(?:\+?880|0)?1[3-9]\d{8}$').hasMatch(v.replaceAll(RegExp(r'[\s-]'), ''));
-  static bool isValidEmail(String v) => RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(v.trim());
+      RegExp(r'^(?:\+?880|0)?1[3-9]\d{8}$')
+          .hasMatch(v.replaceAll(RegExp(r'[\s-]'), ''));
+  static bool isValidEmail(String v) =>
+      RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(v.trim());
 
   String? login(String cred, String pass) {
     if (cred.trim().isEmpty) return t('errCred');
@@ -336,17 +494,42 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  String? register({required String name, required String cred, required String pass, required String role, required Loc location, required List<String> crops}) {
+  String? register({
+    required String name,
+    required String cred,
+    required String pass,
+    required String role,
+    required Loc location,
+    required List<String> crops,
+  }) {
     if (name.trim().isEmpty) return t('errName');
     if (cred.trim().isEmpty) return t('errCred');
     if (!isValidPhone(cred) && !isValidEmail(cred)) return t('errCredFormat');
     if (pass.length < 4) return t('errPass');
     for (final x in users) {
-      if (x.cred.toLowerCase() == cred.trim().toLowerCase()) return t('errDup');
+      if (x.cred.toLowerCase() == cred.trim().toLowerCase()) {
+        // Re-submitting the same number+password they just registered (e.g. an
+        // accidental double-tap, or confusion after not seeing an immediate
+        // screen change) is far more likely than a genuine collision with a
+        // stranger's account — so just log them into it instead of blocking
+        // them with an error for what is, from their perspective, their own
+        // account.
+        if (x.pass == pass) {
+          _setSession(x.id);
+          return null;
+        }
+        return t('errDup');
+      }
     }
     final u = AppUser(
-      id: 'u${DateTime.now().millisecondsSinceEpoch}', name: name.trim(), cred: cred.trim(), pass: pass,
-      role: role, location: location, crops: crops, createdAt: DateTime.now().millisecondsSinceEpoch,
+      id: 'u${DateTime.now().millisecondsSinceEpoch}',
+      name: name.trim(),
+      cred: cred.trim(),
+      pass: pass,
+      role: role,
+      location: location,
+      crops: crops,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     users.add(u);
     _saveUser(u);
@@ -366,7 +549,11 @@ class AppState extends ChangeNotifier {
     final u = currentUser;
     final loc = u?.location ?? Loc(22.3569, 91.7832, 'Chattogram');
     final mode = weatherMode;
-    if (!force && _wx != null && DateTime.now().millisecondsSinceEpoch - _wxTs < 3600000 && _wxMode == mode && _wxLoc == loc.label) {
+    if (!force &&
+        _wx != null &&
+        DateTime.now().millisecondsSinceEpoch - _wxTs < 3600000 &&
+        _wxMode == mode &&
+        _wxLoc == loc.label) {
       return _wx!;
     }
     List<WxDay> days;
@@ -389,7 +576,8 @@ class AppState extends ChangeNotifier {
   // ------------------------------------------------------------------ //
   // Market queries
   // ------------------------------------------------------------------ //
-  bool _isFresh(int ts) => DateTime.now().millisecondsSinceEpoch - ts < 3 * 24 * 3600 * 1000;
+  bool _isFresh(int ts) =>
+      DateTime.now().millisecondsSinceEpoch - ts < 3 * 24 * 3600 * 1000;
 
   List<MarketRow> marketsWithPrice(String cropId, double radius) {
     final u = currentUser;
@@ -398,30 +586,64 @@ class AppState extends ChangeNotifier {
     for (final m in markets) {
       final dist = haversine(lat, lon, m.lat, m.lon);
       if (dist > radius) continue;
-      final entries = prices.where((p) => p.marketId == m.id && p.cropId == cropId).toList()..sort((a, b) => b.ts - a.ts);
+      final entries =
+          prices.where((p) => p.marketId == m.id && p.cropId == cropId).toList()
+            ..sort((a, b) => b.ts - a.ts);
       final latest = entries.isNotEmpty ? entries.first : null;
-      rows.add(MarketRow(m, dist, latest, latest != null && _isFresh(latest.ts), entries.length));
+      rows.add(
+        MarketRow(
+          m,
+          dist,
+          latest,
+          latest != null && _isFresh(latest.ts),
+          entries.length,
+        ),
+      );
     }
     return rows;
   }
 
   List<PriceEntry> marketEntries(String marketId, String cropId) {
-    final e = prices.where((p) => p.marketId == marketId && p.cropId == cropId).toList()..sort((a, b) => b.ts - a.ts);
+    final e =
+        prices
+            .where((p) => p.marketId == marketId && p.cropId == cropId)
+            .toList()
+          ..sort((a, b) => b.ts - a.ts);
     return e.take(8).toList();
   }
 
   // ------------------------------------------------------------------ //
   // Price submit / targets
   // ------------------------------------------------------------------ //
-  Future<void> submitPrice({required String cropId, required String marketId, required int price, String? newMarketName}) async {
+  Future<void> submitPrice({
+    required String cropId,
+    required String marketId,
+    required int price,
+    String? newMarketName,
+  }) async {
     final u = currentUser!;
-    if (marketId == '__new' && newMarketName != null && newMarketName.trim().isNotEmpty) {
+    if (marketId == '__new' &&
+        newMarketName != null &&
+        newMarketName.trim().isNotEmpty) {
       marketId = 'm${DateTime.now().millisecondsSinceEpoch}';
-      await _addMarket(Market(marketId, newMarketName.trim(), newMarketName.trim(), u.location.lat, u.location.lon));
+      await _addMarket(
+        Market(
+          marketId,
+          newMarketName.trim(),
+          newMarketName.trim(),
+          u.location.lat,
+          u.location.lon,
+        ),
+      );
     }
     final p = PriceEntry(
-      id: 'p${DateTime.now().millisecondsSinceEpoch}', cropId: cropId, marketId: marketId,
-      price: price, by: u.name, role: u.role, ts: DateTime.now().millisecondsSinceEpoch,
+      id: 'p${DateTime.now().millisecondsSinceEpoch}',
+      cropId: cropId,
+      marketId: marketId,
+      price: price,
+      by: u.name,
+      role: u.role,
+      ts: DateTime.now().millisecondsSinceEpoch,
     );
     _alertedPrice.remove('$cropId:${_todayKey()}');
     await _addPrice(p);
@@ -449,10 +671,25 @@ class AppState extends ChangeNotifier {
   // ------------------------------------------------------------------ //
   // Reminders
   // ------------------------------------------------------------------ //
-  Future<void> saveReminder({String? id, required String type, required String cropId, required String repeat, required String time}) async {
+  Future<void> saveReminder({
+    String? id,
+    required String type,
+    required String cropId,
+    required String repeat,
+    required String time,
+  }) async {
     final u = currentUser!;
     if (id != null) {
-      final r = u.reminders.firstWhere((x) => x.id == id, orElse: () => Reminder(id: '', type: type, cropId: cropId, repeat: repeat, time: time));
+      final r = u.reminders.firstWhere(
+        (x) => x.id == id,
+        orElse: () => Reminder(
+          id: '',
+          type: type,
+          cropId: cropId,
+          repeat: repeat,
+          time: time,
+        ),
+      );
       if (r.id.isNotEmpty) {
         r.type = type;
         r.cropId = cropId;
@@ -460,7 +697,15 @@ class AppState extends ChangeNotifier {
         r.time = time;
       }
     } else {
-      u.reminders.add(Reminder(id: 'r${DateTime.now().millisecondsSinceEpoch}', type: type, cropId: cropId, repeat: repeat, time: time));
+      u.reminders.add(
+        Reminder(
+          id: 'r${DateTime.now().millisecondsSinceEpoch}',
+          type: type,
+          cropId: cropId,
+          repeat: repeat,
+          time: time,
+        ),
+      );
     }
     if (_wx != null) applyWeatherReschedule(_wx!, save: false);
     await _saveUser(u);
@@ -543,7 +788,12 @@ class AppState extends ChangeNotifier {
     final u = currentUser;
     if (u == null) return null;
     for (final entry in u.targets.entries) {
-      final matches = marketsWithPrice(entry.key, 100).where((m) => m.latest != null && m.fresh && m.latest!.price >= entry.value).toList();
+      final matches = marketsWithPrice(entry.key, 100)
+          .where(
+            (m) =>
+                m.latest != null && m.fresh && m.latest!.price >= entry.value,
+          )
+          .toList();
       if (matches.isEmpty) continue;
       final key = '${entry.key}:${_todayKey()}';
       if (_alertedPrice.contains(key)) continue;
@@ -559,7 +809,11 @@ class AppState extends ChangeNotifier {
 
 // ---- small format helpers (used by UI) ----
 final _honorific = RegExp(r'^(mr|mrs|ms|md|dr|mst)\.?$', caseSensitive: false);
-List<String> nameParts(String s) => s.trim().split(RegExp(r'\s+')).where((x) => x.isNotEmpty && !_honorific.hasMatch(x)).toList();
+List<String> nameParts(String s) => s
+    .trim()
+    .split(RegExp(r'\s+'))
+    .where((x) => x.isNotEmpty && !_honorific.hasMatch(x))
+    .toList();
 String firstName(String s) {
   final p = nameParts(s);
   return p.isNotEmpty ? p.first : 'Farmer';
