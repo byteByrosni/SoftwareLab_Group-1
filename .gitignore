@@ -85,4 +85,5 @@ migrate_working_dir/
 !**/ios/**/default.mode2v3
 !**/ios/**/default.pbxuser
 !**/ios/**/default.perspectivev3
-/DEMO_GUIDE.md
+
+DEMO_GUIDE.md
