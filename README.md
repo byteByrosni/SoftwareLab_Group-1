@@ -34,7 +34,7 @@ ngrok. The backend serves both `build/web` and `/api`, so all phones use one URL
 and share the same SQLite database.
 
 ```powershell
-cd "C:\Users\Rosni Bente\Downloads\SoftwareLab_Group-1"
+cd "to the folder you have cloned the repo"
 flutter build web --release
 
 cd backend
@@ -55,4 +55,3 @@ For the one-tunnel setup, no `.env` file is required. Use `KB_API_BASE` only if
 you serve the frontend from a different URL than the backend, or for native APK
 builds.
 
-See [DEMO_GUIDE.md](DEMO_GUIDE.md) for the full runbook and troubleshooting.
